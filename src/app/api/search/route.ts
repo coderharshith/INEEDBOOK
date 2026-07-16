@@ -1,20 +1,8 @@
-/**
- * Brave Search Scraper Route
- *
- * Scrapes Brave Search results for PDF links matching the query.
- * Executes multiple query variants (filetype:pdf, quoted title, author-specific)
- * to maximize discovery of relevant PDF sources. Deduplicates results by URL.
- *
- * @route GET /api/search?title=<title>&author=<author>&isbn=<isbn>
- */
-
 import { NextRequest, NextResponse } from 'next/server';
 import * as cheerio from 'cheerio';
 
-/** Disable static caching — search results are always fresh */
 export const dynamic = 'force-dynamic';
 
-/** A single PDF search result extracted from Brave Search HTML */
 interface SearchResult {
   title: string;
   link: string;
@@ -23,20 +11,42 @@ interface SearchResult {
   fileFormat?: string;
 }
 
-/**
- * Scrapes Brave Search results for a given query.
- * Uses two extraction methods:
- *   1. Cheerio-based HTML parsing of anchor elements containing .pdf URLs
- *   2. Regex fallback to extract any PDF URLs missed by the HTML parser
- *
- * @param query - The search query string
- * @returns Array of SearchResult objects with PDF links
- */
-async function scrapeBraveSearch(query: string): Promise<SearchResult[]> {
+function cleanTitle(raw: string): string {
+  let t = raw;
+  t = t.replace(/\([^)]*\.(pdf|com|org|net|edu)[^)]*\)/gi, '');
+  t = t.replace(/\[[^\]]*\.(pdf|com|org|net|edu)[^\]]*\]/gi, '');
+  t = t.replace(/[-–—|_]+ *(PDFDrive|z-lib|libgen|pdf|download|free|online).*$/gi, '');
+  t = t.replace(/\.(pdf|epub|djvu|zip)$/gi, '');
+  t = t.replace(/\\?\(.*?\\?\)\.pdf/gi, '');
+  t = t.replace(/[^a-zA-Z0-9\s:'.,!?&\-]/g, ' ');
+  t = t.replace(/\s+/g, ' ').trim();
+  return t || raw;
+}
+
+function isPdfUrl(url: string): boolean {
+  const lower = url.toLowerCase();
+  if (lower.includes('.pdf')) return true;
+  const noQuery = lower.split('?')[0];
+  if (noQuery.endsWith('.pdf')) return true;
+  return false;
+}
+
+function shouldExclude(url: string, title: string): boolean {
+  const lower = url.toLowerCase();
+  if (lower.includes('google.com') || lower.includes('youtube.com')) return true;
+  if (lower.includes('wikipedia.org') || lower.includes('reddit.com')) return true;
+  if (lower.includes('facebook.com') || lower.includes('twitter.com')) return true;
+  if (lower.includes('goodreads.com') && !lower.includes('.pdf')) return true;
+  if (title.toLowerCase().includes('summary') && title.toLowerCase().includes('book')) return true;
+  if (title.toLowerCase().includes('review') && !title.toLowerCase().includes('.pdf')) return true;
+  return false;
+}
+
+async function scrapeDuckDuckGo(query: string): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
 
   try {
-    const url = `https://search.brave.com/search?q=${encodeURIComponent(query)}`;
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
     const response = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
@@ -51,39 +61,26 @@ async function scrapeBraveSearch(query: string): Promise<SearchResult[]> {
     const html = await response.text();
     const $ = cheerio.load(html);
 
-    // Method 1: Parse structured search results
-    $('a[href]').each((i, el) => {
-      const href = $(el).attr('href') || '';
-      
-      // Skip Brave internal links
-      if (href.includes('brave.com') || href.startsWith('/') || href.startsWith('#')) return;
-      
-      // Only want external PDF links
-      if (!href.toLowerCase().includes('.pdf')) return;
+    $('.result__body').each((i, el) => {
+      const linkEl = $(el).find('.result__a');
+      const href = linkEl.attr('href') || '';
+      const rawTitle = linkEl.text().trim();
+      const snippet = $(el).find('.result__snippet').text().trim();
 
-      let cleanUrl = href;
+      let cleanUrl = '';
       try {
-        const parsed = new URL(href);
-        cleanUrl = parsed.href;
-      } catch {
-        return;
-      }
+        if (href.includes('uddg=')) {
+          const uddg = href.split('uddg=')[1].split('&')[0];
+          cleanUrl = decodeURIComponent(uddg);
+        } else if (href.startsWith('http')) {
+          cleanUrl = href;
+        }
+      } catch { return; }
 
-      const linkText = $(el).text().trim();
-      if (!linkText || linkText.length < 3) return;
+      if (!cleanUrl || !cleanUrl.startsWith('http')) return;
 
-      // Get snippet from parent or sibling elements
-      let snippet = '';
-      const card = $(el).closest('[class*="snippet"]');
-      if (card.length) {
-        snippet = card.find('[class*="description"], [class*="body"], p').first().text().trim();
-      }
-      if (!snippet) {
-        // Try to get surrounding text
-        const parent = $(el).parent();
-        const nextP = parent.find('p, span[class*="desc"]').first();
-        if (nextP.length) snippet = nextP.text().trim();
-      }
+      if (!isPdfUrl(cleanUrl)) return;
+      if (shouldExclude(cleanUrl, rawTitle)) return;
 
       let displayLink = '';
       try {
@@ -92,8 +89,10 @@ async function scrapeBraveSearch(query: string): Promise<SearchResult[]> {
         displayLink = 'unknown';
       }
 
+      const cleaned = cleanTitle(rawTitle);
+
       results.push({
-        title: linkText.substring(0, 200),
+        title: cleaned.substring(0, 200),
         link: cleanUrl,
         snippet: snippet.substring(0, 500),
         displayLink,
@@ -101,59 +100,13 @@ async function scrapeBraveSearch(query: string): Promise<SearchResult[]> {
       });
     });
 
-    // Method 2: Fallback — extract all PDF URLs via regex if cheerio missed them
-    if (results.length < 3) {
-      const linkRegex = /href="(https?:\/\/[^"]+\.pdf[^"]*)"/gi;
-      let match;
-      const seenInFallback = new Set(results.map(r => r.link));
-      
-      while ((match = linkRegex.exec(html)) !== null) {
-        let pdfUrl = match[1];
-        if (pdfUrl.includes('brave.com')) continue;
-
-        try {
-          pdfUrl = decodeURIComponent(pdfUrl);
-        } catch { /* keep original */ }
-
-        if (seenInFallback.has(pdfUrl)) continue;
-        seenInFallback.add(pdfUrl);
-
-        let displayLink = '';
-        try {
-          displayLink = new URL(pdfUrl).hostname;
-        } catch {
-          displayLink = 'unknown';
-        }
-
-        // Extract a title from the URL path
-        const pathParts = pdfUrl.split('/');
-        const filename = pathParts[pathParts.length - 1]
-          .replace('.pdf', '')
-          .replace(/[_+%20-]+/g, ' ')
-          .trim();
-
-        results.push({
-          title: `PDF ${filename || 'Document'}`,
-          link: pdfUrl,
-          snippet: '',
-          displayLink,
-          fileFormat: 'PDF',
-        });
-      }
-    }
-
   } catch (err) {
-    console.error('Brave scrape error:', err);
+    console.error('DuckDuckGo scrape error:', err);
   }
 
   return results;
 }
 
-/**
- * GET handler for /api/search
- * Executes up to 3 search queries with increasing specificity and returns
- * deduplicated results sorted by relevance.
- */
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
   const title = searchParams.get('title') || '';
@@ -168,49 +121,32 @@ export async function GET(request: NextRequest) {
   const allResults: SearchResult[] = [];
   const seenLinks = new Set<string>();
 
-  // Primary query: best single search for finding book PDFs
-  const primaryQuery = `${cleanTitle} filetype:pdf`;
-  const primaryResults = await scrapeBraveSearch(primaryQuery);
+  const queries = [
+    `"${cleanTitle}" filetype:pdf book`,
+    `"${cleanTitle}" PDF download full book`,
+  ];
 
-  for (const result of primaryResults) {
-    const normalizedLink = result.link.toLowerCase().split('?')[0].split('#')[0];
-    if (!seenLinks.has(normalizedLink)) {
-      seenLinks.add(normalizedLink);
-      allResults.push(result);
-    }
+  if (author.trim()) {
+    queries.push(`"${author.trim()}" "${cleanTitle}" PDF`);
   }
 
-  // If we got fewer than 5 results, try a second query
-  if (allResults.length < 5) {
-    const secondQuery = `"${cleanTitle}" PDF download book`;
-    const secondResults = await scrapeBraveSearch(secondQuery);
+  for (const query of queries) {
+    const results = await scrapeDuckDuckGo(query);
 
-    for (const result of secondResults) {
+    for (const result of results) {
       const normalizedLink = result.link.toLowerCase().split('?')[0].split('#')[0];
       if (!seenLinks.has(normalizedLink)) {
         seenLinks.add(normalizedLink);
         allResults.push(result);
       }
     }
-  }
 
-  // Author-specific query if provided
-  if (allResults.length < 3 && author.trim()) {
-    const authorQuery = `${author.trim()} "${cleanTitle}" PDF`;
-    const authorResults = await scrapeBraveSearch(authorQuery);
-
-    for (const result of authorResults) {
-      const normalizedLink = result.link.toLowerCase().split('?')[0].split('#')[0];
-      if (!seenLinks.has(normalizedLink)) {
-        seenLinks.add(normalizedLink);
-        allResults.push(result);
-      }
-    }
+    if (allResults.length >= 8) break;
   }
 
   return NextResponse.json({
     results: allResults,
     totalFound: allResults.length,
-    queriesExecuted: allResults.length >= 5 ? 1 : allResults.length >= 3 ? 2 : 3,
+    queriesExecuted: allResults.length >= 8 ? 1 : allResults.length >= 4 ? 2 : 3,
   });
 }

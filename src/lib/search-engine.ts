@@ -40,6 +40,12 @@ const DOMAIN_TRUST_TABLE: DomainTrustEntry[] = [
   { pattern: /acm\.org$/i, score: 0.8, label: 'Publisher' },
   { pattern: /mit\.edu$/i, score: 1.0, label: 'Educational Institution' },
   { pattern: /stanford\.edu$/i, score: 1.0, label: 'Educational Institution' },
+  { pattern: /archive\.org$/i, score: 0.85, label: 'Digital Library' },
+  { pattern: /openlibrary\.org$/i, score: 0.85, label: 'Digital Library' },
+  { pattern: /gutenberg\.org$/i, score: 0.85, label: 'Digital Library' },
+  { pattern: /pdfdrive\./i, score: 0.6, label: 'PDF Repository' },
+  { pattern: /z-lib\./i, score: 0.6, label: 'PDF Repository' },
+  { pattern: /libgen\./i, score: 0.65, label: 'Library Genesis' },
 ];
 
 // ─── Scoring Weights ─────────────────────────────────────────────────────────
@@ -273,22 +279,39 @@ export function scoreCandidate(
   expectedAuthor?: string,
   expectedIsbn?: string
 ): ScoredResult {
-  // Title score via Jaro-Winkler
-  const titleScore = calculateJaroWinkler(expectedTitle, candidate.title);
+  const cleanExpected = expectedTitle.toLowerCase().trim();
+  const cleanCandidate = candidate.title.toLowerCase().trim();
+  const candidateText = `${candidate.title} ${candidate.snippet}`.toLowerCase();
 
-  // Author score via Jaro-Winkler (if provided)
+  let titleScore = calculateJaroWinkler(expectedTitle, candidate.title);
+
+  const expectedTerms = cleanExpected.split(/\s+/).filter(t => t.length > 2);
+  if (expectedTerms.length > 0) {
+    const matchedTerms = expectedTerms.filter(term => candidateText.includes(term));
+    const termRatio = matchedTerms.length / expectedTerms.length;
+    titleScore = Math.max(titleScore, termRatio * 0.95);
+  }
+
+  if (cleanCandidate.includes(cleanExpected) || cleanExpected.includes(cleanCandidate)) {
+    titleScore = Math.max(titleScore, 0.98);
+  }
+
   let authorScore = 0;
   if (expectedAuthor && expectedAuthor.trim()) {
-    // Check snippet and title for author name
+    const authorLower = expectedAuthor.toLowerCase().trim();
     const combinedText = `${candidate.title} ${candidate.snippet}`;
     authorScore = calculateJaroWinkler(expectedAuthor, combinedText);
-    // Also try direct match in snippet
-    if (combinedText.toLowerCase().includes(expectedAuthor.toLowerCase())) {
+    if (combinedText.toLowerCase().includes(authorLower)) {
       authorScore = Math.max(authorScore, 0.95);
+    }
+    const authorParts = authorLower.split(/\s+/).filter(p => p.length > 2);
+    if (authorParts.length > 0) {
+      const matchedAuthorParts = authorParts.filter(part => candidateText.includes(part));
+      const authorPartRatio = matchedAuthorParts.length / authorParts.length;
+      authorScore = Math.max(authorScore, authorPartRatio * 0.9);
     }
   }
 
-  // ISBN score (binary)
   let isbnScore = 0;
   if (expectedIsbn && expectedIsbn.trim()) {
     const normalizedIsbn = expectedIsbn.replace(/[-\s]/g, '');
@@ -298,10 +321,8 @@ export function scoreCandidate(
     }
   }
 
-  // Trust score
   const trust = getDomainTrust(candidate.link);
 
-  // Total weighted score
   const total =
     WEIGHTS.title * titleScore +
     WEIGHTS.author * authorScore +
