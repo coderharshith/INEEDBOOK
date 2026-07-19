@@ -1,4 +1,4 @@
-# iNEEDBOOK
+# INEEDBOOK
 
 A fast, clean book discovery engine that finds, validates, and previews PDF books in real-time. Search by title, author, or ISBN to find and preview books instantly.
 
